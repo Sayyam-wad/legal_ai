@@ -46,7 +46,8 @@ def ask():
     except (TypeError, ValueError):
         top_k = 5
     try:
-        resp = get_assistant().ask(query, top_k=top_k)
+        want_answer = bool(data.get("answer", os.getenv("LEGAL_AI_ANSWER", "1") != "0"))
+        resp = get_assistant().ask(query, top_k=top_k, answer=want_answer)
     except FileNotFoundError as e:
         return jsonify({"error": str(e)}), 503
     payload = resp.to_dict()
@@ -98,6 +99,7 @@ PAGE = r"""<!doctype html>
   .section { font:600 12px system-ui,sans-serif; letter-spacing:.08em; text-transform:uppercase; color:var(--muted); margin:28px 0 4px }
   .note { font:13px system-ui,sans-serif; color:var(--muted); border-left:3px solid var(--line); padding-left:10px }
   .err { color:var(--bad); font-family:system-ui,sans-serif }
+  .answer { border-left:4px solid var(--accent) } .answer a { color:var(--accent); text-decoration:none; font:600 13px system-ui,sans-serif }
 </style>
 </head>
 <body>
@@ -137,10 +139,16 @@ $("#f").onsubmit = async e => {
   finally { $("#go").disabled = false; $("#go").textContent = "Search"; }
 };
 function render(d) {
-  let h = `<p class="section">Judgments · intent: ${esc(d.intent)}</p>`;
+  let h = "";
+  if (d.answer) {
+    const linked = esc(d.answer.text).replace(/\[((?:C|S)\d+)\]/g, '<a href="#$1">[$1]</a>');
+    h += `<p class="section">Answer · ${esc(d.answer.provider)}</p><div class="card answer"><p>${linked}</p>
+      ${d.answer.removed_citations.length ? `<p class="note">Removed citations to sources that were not retrieved: ${esc(d.answer.removed_citations.join(", "))}</p>` : ""}</div>`;
+  }
+  h += `<p class="section">Judgments · intent: ${esc(d.intent)}</p>`;
   if (!d.cases.length) h += '<p class="note">No matching judgments.</p>';
   d.cases.forEach((c, i) => {
-    h += `<div class="card"><h3>${i+1}. ${esc(c.title)}${c.year ? ` (${esc(c.year)})` : ""}</h3>
+    h += `<div class="card" id="${esc(c.case_id)}"><h3>${i+1}. ${esc(c.title)}${c.year ? ` (${esc(c.year)})` : ""}</h3>
       <div class="meta"><span>${esc(c.case_id)}</span>
         <span>relevance <span class="bar"><span style="width:${Math.round(c.relevance*100)}%"></span></span> ${Math.round(c.relevance*100)}%</span>
         <span class="pill ${esc(c.outcome.split(" ")[0])}">${esc(c.outcome)}</span>
@@ -151,7 +159,7 @@ function render(d) {
   });
   if (d.statutes.length) {
     h += '<p class="section">Statutes</p>';
-    d.statutes.forEach(s => h += `<div class="card"><h3>${esc(s.title)}</h3><div class="meta"><span>${esc(s.statute_id)}</span><span>relevance ${Math.round(s.relevance*100)}%</span></div><p>${esc(s.text)}</p></div>`);
+    d.statutes.forEach(s => h += `<div class="card" id="${esc(s.statute_id)}"><h3>${esc(s.title)}</h3><div class="meta"><span>${esc(s.statute_id)}</span><span>relevance ${Math.round(s.relevance*100)}%</span></div><p>${esc(s.text)}</p></div>`);
   }
   const o = d.outcome_summary;
   h += `<p class="section">Outcomes in similar cases</p><div class="card">

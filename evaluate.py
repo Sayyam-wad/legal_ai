@@ -30,7 +30,6 @@ import numpy as np
 import pandas as pd
 
 import config
-from legal_text import tokenize
 
 
 # ── metrics ───────────────────────────────────────────────────────────────────
@@ -65,16 +64,11 @@ def evaluate_run(run: dict[str, list[str]], qrels: dict[str, set[str]]) -> dict[
 
 # ── retrieval methods ─────────────────────────────────────────────────────────
 def bm25_run(queries: dict[str, str], cases: pd.DataFrame, depth: int) -> dict[str, list[str]]:
-    from rank_bm25 import BM25Okapi
+    from lexical import BM25Index
     print("  building BM25 over full case texts...")
-    bm25 = BM25Okapi([tokenize(t) for t in cases["text"]])
+    bm25 = BM25Index().fit(cases["text"].tolist())
     ids = cases["case_id"].tolist()
-    run = {}
-    for qid, q in queries.items():
-        scores = bm25.get_scores(tokenize(q))
-        top = np.argsort(-scores)[:depth]
-        run[qid] = [ids[i] for i in top]
-    return run
+    return {qid: [ids[i] for i in bm25.top_k(q, depth)[0]] for qid, q in queries.items()}
 
 
 def dense_run(queries: dict[str, str], model_name: str | None, depth: int) -> dict[str, list[str]]:

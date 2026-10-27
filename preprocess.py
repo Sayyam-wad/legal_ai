@@ -17,8 +17,14 @@ import json
 from pathlib import Path
 
 import config
-from legal_text import (appellant_type, chunk_sentences, extract_citations,
-                        extract_outcome, parse_case_header, split_sentences)
+from legal_text import (
+    appellant_type,
+    chunk_sentences,
+    extract_citations,
+    extract_outcome,
+    parse_case_header,
+    split_sentences,
+)
 
 
 def read_txt(filepath: Path) -> str:

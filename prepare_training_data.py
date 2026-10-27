@@ -20,11 +20,10 @@ import random
 
 import numpy as np
 import pandas as pd
-from rank_bm25 import BM25Okapi
 from tqdm import tqdm
 
 import config
-from legal_text import tokenize
+from lexical import BM25Index
 
 
 def main():
@@ -54,7 +53,7 @@ def main():
     chunks = pd.read_csv(config.CHUNKS_CSV, usecols=["doc_id", "doc_type", "chunk_idx", "text"])
     chunks = chunks[chunks["doc_type"] == "case"].reset_index(drop=True)
     print(f"Indexing {len(chunks)} case chunks with BM25...")
-    bm25 = BM25Okapi([tokenize(t) for t in tqdm(chunks["text"], desc="tokenize")])
+    bm25 = BM25Index().fit(chunks["text"].tolist())
     chunk_doc = chunks["doc_id"].to_numpy()
     by_doc = chunks.groupby("doc_id").indices
 
@@ -62,7 +61,7 @@ def main():
         triplets = []
         for qid in tqdm(split_qids, desc="triplets"):
             query = queries[qid]
-            scores = bm25.get_scores(tokenize(query))
+            scores = bm25.scores(query)
             rel_set = set(positives[qid])
             # Hard negatives: top BM25 passages from cases NOT judged relevant.
             neg_pool, seen_docs = [], set()

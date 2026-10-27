@@ -2,7 +2,7 @@
 
 Pipeline
   1. intent detection      -> which rhetorical-role indexes to emphasise
-  2. dense retrieval       -> fine-tuned InLegalBERT over the ALL index + role indexes
+  2. hybrid retrieval      -> fine-tuned InLegalBERT (ALL + role indexes) + BM25, fused by RRF
   3. chunk-level reranking -> cross-encoder scores each candidate passage, a case
                               is scored by its best passage
   4. explanation           -> key sentences per case, attributed to that case
@@ -19,7 +19,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import math
 import re
 import sys
 from collections import Counter, defaultdict
@@ -97,6 +96,17 @@ def query_terms(query: str) -> set[str]:
     return {w for w in words if w not in _STOPWORDS and (len(w) > 2 or w.isdigit())}
 
 
+def rrf_fuse(ranked_lists: list[list[int]], weights: list[float] | None = None,
+             k: int = 60) -> dict[int, float]:
+    """Weighted reciprocal-rank fusion: sum of w / (k + rank) over the lists an item appears in."""
+    weights = weights or [1.0] * len(ranked_lists)
+    fused: dict[int, float] = defaultdict(float)
+    for ranked, w in zip(ranked_lists, weights):
+        for rank, item in enumerate(ranked, 1):
+            fused[item] += w / (k + rank)
+    return dict(fused)
+
+
 # ── Result types ──────────────────────────────────────────────────────────────
 @dataclass
 class CaseResult:
@@ -129,6 +139,7 @@ class AssistantResponse:
     outcome_summary: dict
     disclaimer: str = DISCLAIMER
     notes: list[str] = field(default_factory=list)
+    answer: dict | None = None   # grounded, cited summary (see answer.py)
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -172,6 +183,12 @@ class LegalAssistant:
             self.indexes[name] = faiss.read_index(str(index_dir / f"index_{name}.bin"))
             if name != config.ALL_INDEX:
                 self.positions[name] = np.load(index_dir / f"positions_{name}.npy")
+        self.bm25 = None
+        if (index_dir / "bm25.pkl").exists():
+            from lexical import BM25Index
+            self.bm25 = BM25Index.load(index_dir / "bm25.pkl")
+        else:
+            self._log("No bm25.pkl found: running dense-only. Re-run build_role_index.py for hybrid search.")
 
         cases = pd.read_csv(config.CASES_CSV, keep_default_na=False,
                             usecols=["case_id", "title", "year", "outcome", "appellant", "citations"])
@@ -186,30 +203,39 @@ class LegalAssistant:
             print(msg, file=sys.stderr)
 
     # ── retrieval ─────────────────────────────────────────────────────────────
-    def _retrieve(self, query_emb: np.ndarray, roles: list[str], k_all: int, k_role: int) -> dict[int, float]:
-        """Return {row in meta_ALL: L2 distance} for the candidate chunks."""
-        candidates: dict[int, float] = {}
-        dist, idx = self.indexes[config.ALL_INDEX].search(query_emb, min(k_all, len(self.meta)))
-        for d, i in zip(dist[0], idx[0]):
-            if i >= 0:
-                candidates[int(i)] = float(d)
+    def _retrieve(self, query: str, query_emb: np.ndarray, roles: list[str],
+                  k_all: int, k_role: int, k_lex: int) -> dict[int, float]:
+        """Hybrid candidate generation.
+
+        Dense hits from the ALL index and the intent's role indexes, plus lexical
+        BM25 hits (exact section numbers, names and legal terms that embeddings
+        blur), fused with reciprocal-rank fusion. Returns {row in meta_ALL: score}.
+        """
+        # Weights: the ALL dense index and BM25 count equally; role indexes add a
+        # smaller intent-specific boost so they can't outvote the lexical signal.
+        ranked_lists: list[list[int]] = []
+        weights: list[float] = []
+        _, idx = self.indexes[config.ALL_INDEX].search(query_emb, min(k_all, len(self.meta)))
+        ranked_lists.append([int(i) for i in idx[0] if i >= 0])
+        weights.append(1.0)
         for role in roles:
             if role not in self.indexes:
                 continue
             index = self.indexes[role]
-            dist, idx = index.search(query_emb, min(k_role, index.ntotal))
-            for d, i in zip(dist[0], idx[0]):
-                if i < 0:
-                    continue
-                pos = int(self.positions[role][i])
-                candidates[pos] = min(float(d), candidates.get(pos, math.inf))
-        return candidates
+            _, idx = index.search(query_emb, min(k_role, index.ntotal))
+            ranked_lists.append([int(self.positions[role][i]) for i in idx[0] if i >= 0])
+            weights.append(0.3)
+        if self.bm25 is not None and k_lex > 0:
+            idx, s = self.bm25.top_k(query, k_lex)
+            ranked_lists.append([int(i) for i, v in zip(idx, s) if v > 0])
+            weights.append(1.0)
+        return rrf_fuse(ranked_lists, weights)
 
-    def _score(self, query: str, rows: list[int], distances: dict[int, float]) -> np.ndarray:
+    def _score(self, query: str, rows: list[int], fused: dict[int, float]) -> np.ndarray:
         if self.cross_encoder is None:
-            # Turn L2 distances into a 0-1 score relative to the best candidate.
-            d = np.array([distances[r] for r in rows])
-            return np.exp(-(d - d.min()) / (d.std() + 1e-6))
+            # Without a reranker, use the fused rank score scaled to the best candidate.
+            f = np.array([fused[r] for r in rows])
+            return f / f.max()
         pairs = [(query, self.meta.at[r, "text"]) for r in rows]
         raw = np.asarray(self.cross_encoder.predict(pairs, batch_size=32, show_progress_bar=False),
                          dtype=np.float64).reshape(-1)
@@ -218,14 +244,17 @@ class LegalAssistant:
         return raw
 
     def ask(self, query: str, top_k: int = 5, n_statutes: int = 3,
-            k_all: int = 50, k_role: int = 15, max_rerank: int = 100) -> AssistantResponse:
+            k_all: int = 50, k_role: int = 15, k_lex: int = 50, max_rerank: int = 100,
+            answer: bool | str = False) -> AssistantResponse:
+        """Retrieve, rerank and explain. `answer=True` (or a provider name such as
+        "anthropic", "openai", "extractive") also writes a cited summary."""
         query = " ".join(query.split())
         intent = detect_intent(query)
         q_emb = self.bi_encoder.encode([query], convert_to_numpy=True).astype("float32")
 
-        distances = self._retrieve(q_emb, intent.roles, k_all, k_role)
-        rows = sorted(distances, key=distances.get)[:max_rerank]
-        scores = self._score(query, rows, distances)
+        fused = self._retrieve(query, q_emb, intent.roles, k_all, k_role, k_lex)
+        rows = sorted(fused, key=fused.get, reverse=True)[:max_rerank]
+        scores = self._score(query, rows, fused)
 
         # Aggregate chunk scores into documents: a document is as relevant as
         # its best passage (MaxP), with role tags pooled across its passages.
@@ -270,7 +299,13 @@ class LegalAssistant:
         elif cases and max(c.relevance for c in cases) < 0.2:
             notes.append("Low relevance overall: the corpus may not contain a close match for this query. "
                          "Try describing the facts or the legal question more specifically.")
-        return AssistantResponse(query, intent.label, cases, statutes, self._outcome_summary(cases), notes=notes)
+        resp = AssistantResponse(query, intent.label, cases, statutes, self._outcome_summary(cases), notes=notes)
+        if answer:
+            from answer import synthesize
+            d = resp.to_dict()
+            resp.answer = synthesize(query, d["cases"], d["statutes"],
+                                     provider=answer if isinstance(answer, str) else None).to_dict()
+        return resp
 
     # ── explanation ───────────────────────────────────────────────────────────
     @staticmethod
@@ -322,6 +357,13 @@ def format_response(resp: AssistantResponse) -> str:
     if not resp.cases and not resp.statutes:
         out.append("No results found.")
         return "\n".join(out)
+    if resp.answer:
+        a = resp.answer
+        out.append(f"ANSWER  ({a['provider']}{', unsupported citations removed' if a['removed_citations'] else ''})")
+        out.append(a["text"])
+        if a["removed_citations"]:
+            out.append(f"  (removed citations to sources that were not retrieved: {', '.join(a['removed_citations'])})")
+        out.append("")
     out.append("RELEVANT JUDGMENTS")
     for i, c in enumerate(resp.cases, 1):
         year = f" ({c.year})" if c.year else ""
@@ -354,12 +396,14 @@ def main():
     parser.add_argument("--no-rerank", action="store_true", help="skip the cross-encoder (faster)")
     parser.add_argument("--model", default=None, help="bi-encoder (defaults to the one the indexes were built with)")
     parser.add_argument("--json", action="store_true", help="print JSON instead of text")
+    parser.add_argument("--answer", nargs="?", const=True, default=False,
+                        help="add a cited summary; optionally name the provider (anthropic|openai|extractive)")
     args = parser.parse_args()
 
     assistant = LegalAssistant(bi_encoder=args.model, cross_encoder=None if args.no_rerank else config.CROSS_ENCODER)
 
     def run(q: str):
-        resp = assistant.ask(q, top_k=args.top_k)
+        resp = assistant.ask(q, top_k=args.top_k, answer=args.answer)
         print(json.dumps(resp.to_dict(), indent=2) if args.json else format_response(resp))
 
     if args.query:

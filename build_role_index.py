@@ -20,6 +20,7 @@ import pandas as pd
 from sentence_transformers import SentenceTransformer
 
 import config
+from lexical import BM25Index
 
 
 def encode(model_name: str, texts: list[str], batch_size: int, cache_dir) -> np.ndarray:
@@ -63,10 +64,14 @@ def main():
     df.drop(columns=["role"], errors="ignore").to_csv(
         config.INDEX_DIR / f"meta_{config.ALL_INDEX}.csv", index=False)
 
+    # Sparse BM25 over the same chunks, for hybrid (lexical + dense) retrieval.
+    BM25Index().fit(df["text"].astype(str).tolist()).save(config.INDEX_DIR / "bm25.pkl")
+    print("Saved BM25 index")
+
     role_sets = df["roles"].astype(str).str.split("|")
     summary = {config.ALL_INDEX: len(df)}
     for role in config.ROLES:
-        positions = np.flatnonzero(role_sets.apply(lambda rs: role in rs).to_numpy())
+        positions = np.flatnonzero(role_sets.apply(lambda rs, r=role: r in rs).to_numpy())
         if len(positions) == 0:
             print(f"  skip {role}: no chunks")
             continue
@@ -77,7 +82,7 @@ def main():
         summary[role] = int(len(positions))
 
     (config.INDEX_DIR / "manifest.json").write_text(json.dumps(
-        {"model": args.model, "dim": int(dim), "indexes": summary}, indent=2))
+        {"model": args.model, "dim": int(dim), "indexes": summary, "bm25": True}, indent=2))
 
     print("\n══════════ INDEX SUMMARY ══════════")
     for role, n in summary.items():

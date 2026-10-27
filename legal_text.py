@@ -99,7 +99,7 @@ _YEAR_RE = re.compile(r"\b(18|19|20)\d{2}\b")
 
 def parse_case_header(raw: str) -> dict:
     """AILA case files start with: title, court, (blank), date, case number."""
-    lines = [l.strip() for l in raw.splitlines() if l.strip()]
+    lines = [ln.strip() for ln in raw.splitlines() if ln.strip()]
     head = lines[:6]
     title = head[0] if head else ""
     court = head[1] if len(head) > 1 and "court" in head[1].lower() else ""
@@ -157,7 +157,7 @@ def extract_outcome(raw: str) -> str:
     "Appeal dismissed" or "Appeals partly allowed."; we check that first and
     fall back to the last outcome phrase in the final part of the judgment.
     """
-    lines = [l.strip() for l in (raw or "").splitlines() if l.strip()]
+    lines = [ln.strip() for ln in (raw or "").splitlines() if ln.strip()]
     if not lines:
         return "Unclear"
     last = lines[-1]

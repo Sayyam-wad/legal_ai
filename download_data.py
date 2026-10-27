@@ -6,10 +6,11 @@ Setup: kaggle.json ~/.kaggle/ mein rakhna padega
 Run:   python download_data.py
 """
 
-import kagglehub
 import os
 import shutil
 from pathlib import Path
+
+import kagglehub
 
 print("=" * 50)
 print("  INDIAN LEGAL AI — Dataset Download (AILA)")
@@ -36,7 +37,7 @@ try:
             shutil.copy2(f, target)
             print(f"      Copied: {rel}")
 
-    print(f"\n Done! Files saved to data/raw/")
+    print("\n Done! Files saved to data/raw/")
     print("      Ab run karo: python preprocess.py")
 
 except Exception as e:

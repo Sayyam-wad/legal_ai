@@ -17,6 +17,7 @@ import random
 import numpy as np
 import torch
 from sentence_transformers import InputExample, SentenceTransformer, losses
+
 try:  # sentence-transformers >= 6
     from sentence_transformers.sentence_transformer.evaluation import TripletEvaluator
 except ImportError:

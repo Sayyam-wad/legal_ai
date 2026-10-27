@@ -1,16 +1,17 @@
 """Fast unit tests (no models or indexes needed). Run: pytest -q"""
 
-import sys
-from pathlib import Path
-
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-
-from assistant import detect_intent, query_terms  # noqa: E402
-from evaluate import average_precision, evaluate_run, ndcg_at_k  # noqa: E402
-from legal_text import (appellant_type, chunk_sentences, extract_citations,  # noqa: E402
-                        extract_outcome, parse_case_header, split_sentences)
-from preprocess import load_relevance  # noqa: E402
-from tag_roles import sentence_roles, tag_chunk  # noqa: E402
+from assistant import detect_intent, query_terms
+from evaluate import average_precision, evaluate_run, ndcg_at_k
+from legal_text import (
+    appellant_type,
+    chunk_sentences,
+    extract_citations,
+    extract_outcome,
+    parse_case_header,
+    split_sentences,
+)
+from preprocess import load_relevance
+from tag_roles import sentence_roles, tag_chunk
 
 SAMPLE = """Anil Kumar v State of U.P.
 Supreme Court of India

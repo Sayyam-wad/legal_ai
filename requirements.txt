@@ -8,7 +8,8 @@ sentence-transformers>=2.7
 datasets           # needed by sentence-transformers for fine-tuning
 accelerate
 faiss-cpu          # or faiss-gpu on a CUDA machine
-rank-bm25
+scipy
+scikit-learn
 
 # Web app
 flask

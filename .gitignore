@@ -43,3 +43,4 @@ faiss_indexes/
 # Generated
 models/
 .pytest_cache/
+.ruff_cache/

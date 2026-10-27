@@ -1,13 +1,24 @@
 {
   "data_source": "AILA FIRE 2019",
   "total_cases": 2914,
-  "total_queries": 50,
   "total_statutes": 197,
-  "total_chunks": 23727,
-  "prior_relevance_pairs": 437100,
-  "statute_relevance_pairs": 29562,
-  "avg_case_words": 3428.9,
+  "total_queries": 50,
+  "total_chunks": 59081,
+  "case_chunks": 58589,
+  "statute_chunks": 492,
+  "relevant_case_pairs": 195,
+  "judged_case_pairs": 145700,
+  "relevant_statute_pairs": 221,
+  "judged_statute_pairs": 9854,
+  "avg_case_words": 3405.8,
   "avg_query_words": 517.4,
-  "chunk_size": 512,
-  "chunk_overlap": 50
+  "chunk_words": 250,
+  "chunk_overlap_sentences": 2,
+  "case_outcomes": {
+    "Unclear": 82,
+    "Allowed": 1034,
+    "Dismissed": 1210,
+    "Disposed of": 457,
+    "Partly allowed": 131
+  }
 }

@@ -1,7 +1,20 @@
-kagglehub
+# Core
+numpy
 pandas
 tqdm
-scikit-learn
-transformers
 torch
+transformers
+sentence-transformers>=2.7
+datasets           # needed by sentence-transformers for fine-tuning
+accelerate
+faiss-cpu          # or faiss-gpu on a CUDA machine
+rank-bm25
+
+# Web app
 flask
+
+# Data download
+kagglehub
+
+# Tests
+pytest

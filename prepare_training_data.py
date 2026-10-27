@@ -1,150 +1,100 @@
-import os
+"""Build bi-encoder training triplets from the AILA relevance judgments.
+
+Fixes vs. the first version
+  * No hard-coded Windows paths: reads the CSVs produced by preprocess.py.
+  * Query-level train/test split, saved to data/training/query_split.json.
+    Previously triplets were shuffled and split at random, so the same query
+    appeared in training and evaluation and the reported ~96.7% triplet
+    accuracy was inflated.
+  * Positives are the passages of each relevant case that best match the query
+    (BM25), not just the first 300 words (which is mostly the case header).
+  * Hard negatives: passages from non-relevant cases that BM25 ranks highly,
+    which teach the model far more than random cases.
+
+Run: python prepare_training_data.py [--test-queries 10] [--seed 42]
+"""
+
+import argparse
 import json
 import random
+
+import numpy as np
 import pandas as pd
 from tqdm import tqdm
 
-# ── Config ───────────────────────────────────────────────────────────────────
-QUERY_FILE      = r"C:\Users\ASUS\Downloads\aila_data\Query_doc.txt"
-RELEVANCE_FILE  = r"C:\Users\ASUS\Downloads\aila_data\relevance_judgments_priorcases.txt"
-CASES_DIR       = r"C:\Users\ASUS\Downloads\aila_data\Object_casedocs"
-OUTPUT_PATH     = "data/training/training_pairs.json"
-MAX_TEXT_LEN    = 300  # words per chunk for training
+import config
+from lexical import BM25Index
 
-os.makedirs("data/training", exist_ok=True)
 
-# ── Step 1: Load queries ──────────────────────────────────────────────────────
-print("Loading queries...")
-queries = {}
-with open(QUERY_FILE, "r", encoding="utf-8") as f:
-    for line in f:
-        line = line.strip()
-        if "||" in line:
-            parts = line.split("||", 1)
-            qid   = parts[0].strip()
-            text  = parts[1].strip()
-            # Use first 300 words as query representation
-            words = text.split()[:MAX_TEXT_LEN]
-            queries[qid] = " ".join(words)
+def main():
+    p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    p.add_argument("--test-queries", type=int, default=10, help="queries held out for evaluation")
+    p.add_argument("--positives-per-case", type=int, default=2)
+    p.add_argument("--negatives-per-positive", type=int, default=3)
+    p.add_argument("--seed", type=int, default=42)
+    args = p.parse_args()
+    rng = random.Random(args.seed)
 
-print(f"Loaded {len(queries)} queries")
+    queries = pd.read_csv(config.QUERIES_CSV).set_index("query_id")["text"].to_dict()
+    rel = pd.read_csv(config.REL_CASES_CSV)
+    rel = rel[(rel["relevant"] == 1) & rel["case_id"].str.startswith("C")]
+    positives = rel.groupby("query_id")["case_id"].apply(list).to_dict()
 
-# ── Step 2: Load relevance judgments ─────────────────────────────────────────
-print("Loading relevance judgments...")
-relevant   = {}  # qid -> list of relevant case ids
-irrelevant = {}  # qid -> list of irrelevant case ids
+    # ── query-level split ────────────────────────────────────────────────────
+    qids = sorted(positives, key=lambda q: int(q.split("Q")[-1]))
+    rng.shuffle(qids)
+    test = sorted(qids[:args.test_queries], key=lambda q: int(q.split("Q")[-1]))
+    train = sorted(qids[args.test_queries:], key=lambda q: int(q.split("Q")[-1]))
+    config.TRAINING_DIR.mkdir(parents=True, exist_ok=True)
+    config.SPLIT_JSON.write_text(json.dumps({"seed": args.seed, "train": train, "test": test}, indent=2))
+    print(f"Queries with relevant cases: {len(qids)}  ->  train {len(train)} / test {len(test)}")
 
-with open(RELEVANCE_FILE, "r", encoding="utf-8") as f:
-    for line in f:
-        parts = line.strip().split()
-        if len(parts) < 4:
-            continue
-        qid     = parts[0]
-        case_id = parts[2]
-        score   = int(parts[3])
+    # ── BM25 over case chunks ────────────────────────────────────────────────
+    chunks = pd.read_csv(config.CHUNKS_CSV, usecols=["doc_id", "doc_type", "chunk_idx", "text"])
+    chunks = chunks[chunks["doc_type"] == "case"].reset_index(drop=True)
+    print(f"Indexing {len(chunks)} case chunks with BM25...")
+    bm25 = BM25Index().fit(chunks["text"].tolist())
+    chunk_doc = chunks["doc_id"].to_numpy()
+    by_doc = chunks.groupby("doc_id").indices
 
-        if score == 1:
-            relevant.setdefault(qid, []).append(case_id)
-        else:
-            irrelevant.setdefault(qid, []).append(case_id)
+    def build(split_qids):
+        triplets = []
+        for qid in tqdm(split_qids, desc="triplets"):
+            query = queries[qid]
+            scores = bm25.scores(query)
+            rel_set = set(positives[qid])
+            # Hard negatives: top BM25 passages from cases NOT judged relevant.
+            neg_pool, seen_docs = [], set()
+            for i in np.argsort(-scores):
+                d = chunk_doc[i]
+                if d in rel_set or d in seen_docs:
+                    continue
+                seen_docs.add(d)
+                neg_pool.append(chunks.at[i, "text"])
+                if len(neg_pool) >= 30:
+                    break
+            for case_id in positives[qid]:
+                rows = by_doc.get(case_id)
+                if rows is None:
+                    continue
+                best_rows = sorted(rows, key=lambda i: -scores[i])[:args.positives_per_case]
+                for r in best_rows:
+                    for neg in rng.sample(neg_pool, min(args.negatives_per_positive, len(neg_pool))):
+                        triplets.append({"query_id": qid, "query": query,
+                                         "positive": chunks.at[r, "text"], "negative": neg})
+        return triplets
 
-print(f"Queries with relevant cases: {len(relevant)}")
-total_relevant = sum(len(v) for v in relevant.values())
-print(f"Total relevant pairs: {total_relevant}")
+    train_triplets = build(train)
+    test_triplets = build(test)
+    out = config.TRAINING_DIR / "training_pairs.json"
+    with open(out, "w", encoding="utf-8") as f:
+        json.dump({"train": train_triplets, "test": test_triplets,
+                   "stats": {"train_queries": len(train), "test_queries": len(test),
+                             "train_triplets": len(train_triplets), "test_triplets": len(test_triplets)}},
+                  f, indent=1)
+    print(f"\nTrain triplets: {len(train_triplets)} | Test triplets: {len(test_triplets)}")
+    print(f"Saved to {out.relative_to(config.ROOT)}; split in {config.SPLIT_JSON.relative_to(config.ROOT)}")
 
-# ── Step 3: Load case documents ───────────────────────────────────────────────
-print("\nLoading case documents...")
-case_texts = {}
-case_files = os.listdir(CASES_DIR)
 
-for fname in tqdm(case_files):
-    if not fname.endswith(".txt"):
-        continue
-    case_id = fname.replace(".txt", "")
-    fpath   = os.path.join(CASES_DIR, fname)
-    try:
-        with open(fpath, "r", encoding="utf-8", errors="ignore") as f:
-            text  = f.read().strip()
-            words = text.split()[:MAX_TEXT_LEN]
-            case_texts[case_id] = " ".join(words)
-    except:
-        continue
-
-print(f"Loaded {len(case_texts)} case documents")
-
-# ── Step 4: Build training pairs ──────────────────────────────────────────────
-print("\nBuilding training pairs...")
-
-# Format for MultipleNegativesRankingLoss:
-# Each sample = {"query": ..., "positive": ..., "negative": ...}
-# OR just {"query": ..., "positive": ...} — negatives sampled automatically
-
-positive_pairs = []  # (query_text, positive_case_text)
-triplets       = []  # (query_text, positive_case_text, negative_case_text)
-
-skipped = 0
-for qid, pos_cases in relevant.items():
-    if qid not in queries:
-        skipped += 1
-        continue
-
-    query_text = queries[qid]
-    neg_cases  = irrelevant.get(qid, [])
-
-    for pos_case_id in pos_cases:
-        if pos_case_id not in case_texts:
-            continue
-
-        pos_text = case_texts[pos_case_id]
-
-        # Add positive pair
-        positive_pairs.append({
-            "query"   : query_text,
-            "positive": pos_text
-        })
-
-        # Add triplet with random negative
-        if neg_cases:
-            neg_case_id = random.choice(neg_cases)
-            if neg_case_id in case_texts:
-                triplets.append({
-                    "query"   : query_text,
-                    "positive": pos_text,
-                    "negative": case_texts[neg_case_id]
-                })
-
-print(f"\nSkipped queries (not in query file): {skipped}")
-print(f"Positive pairs created: {len(positive_pairs)}")
-print(f"Triplets created      : {len(triplets)}")
-
-# ── Step 5: Save ──────────────────────────────────────────────────────────────
-output = {
-    "positive_pairs": positive_pairs,
-    "triplets"      : triplets,
-    "stats": {
-        "total_queries"       : len(queries),
-        "queries_with_positives": len(relevant),
-        "total_positives"     : len(positive_pairs),
-        "total_triplets"      : len(triplets)
-    }
-}
-
-with open(OUTPUT_PATH, "w", encoding="utf-8") as f:
-    json.dump(output, f, indent=2)
-
-print(f"\n✅ Saved training data to: {OUTPUT_PATH}")
-print(f"\n══════════════════════════════")
-print(f"       TRAINING DATA SUMMARY  ")
-print(f"══════════════════════════════")
-print(f"  Queries          : {len(queries)}")
-print(f"  Positive pairs   : {len(positive_pairs)}")
-print(f"  Triplets         : {len(triplets)}")
-print(f"══════════════════════════════")
-
-# ── Step 6: Show a sample ─────────────────────────────────────────────────────
-print("\nSample triplet:")
-if triplets:
-    s = triplets[0]
-    print(f"  QUERY    : {s['query'][:150]}...")
-    print(f"  POSITIVE : {s['positive'][:150]}...")
-    print(f"  NEGATIVE : {s['negative'][:150]}...")
+if __name__ == "__main__":
+    main()

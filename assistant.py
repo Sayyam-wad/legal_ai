@@ -1,549 +1,423 @@
-# import os
-# os.environ["CUDA_VISIBLE_DEVICES"] = "0"
+"""AI Legal Assistant for Indian case law (AILA 2019 corpus).
+
+Pipeline
+  1. intent detection      -> which rhetorical-role indexes to emphasise
+  2. hybrid retrieval      -> fine-tuned InLegalBERT (ALL + role indexes) + BM25, fused by RRF
+  3. chunk-level reranking -> cross-encoder scores each candidate passage, a case
+                              is scored by its best passage
+  4. explanation           -> key sentences per case, attributed to that case
+  5. outcome summary       -> actual disposition of each retrieved judgment
+
+Usage
+  python assistant.py                                  # interactive
+  python assistant.py -q "bail in a dowry death case"  # one-shot
+  python assistant.py -q "..." --json                  # machine-readable
+  python assistant.py --no-rerank                      # faster, bi-encoder only
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import re
+import sys
+from collections import Counter, defaultdict
+from dataclasses import asdict, dataclass, field
 
-# import pandas as pd
-# import faiss
-# import numpy as np
-# from sentence_transformers import SentenceTransformer, CrossEncoder
-
-# # ── Config ───────────────────────────────────────────────────────────────────
-# INDEX_DIR  = "faiss_indexes"
-# MODEL_NAME = "Sayyam9/legal-bert-aila-finetuned"
-
-# # ── Load models ───────────────────────────────────────────────────────────────
-# print("Loading models...")
-# bi_encoder    = SentenceTransformer(MODEL_NAME, device="cpu")
-# cross_encoder = CrossEncoder("cross-encoder/ms-marco-MiniLM-L-12-v2", device="cpu")
-# print("Models loaded ✅")
-
-# # ── Load indexes ──────────────────────────────────────────────────────────────
-# ROLES = ["RPC", "RATIO", "FAC", "STA", "ISSUE",
-#          "PRE_RELIED", "RLC", "PREAMBLE", "ARG_PETITIONER", "ALL"]
-
-# indexes = {}
-# meta    = {}
-
-# print("Loading indexes...")
-# for role in ROLES:
-#     idx_path  = os.path.join(INDEX_DIR, f"index_{role}.bin")
-#     meta_path = os.path.join(INDEX_DIR, f"meta_{role}.csv")
-
-#     if os.path.exists(idx_path):
-#         indexes[role] = faiss.read_index(idx_path)
-#         meta[role]    = pd.read_csv(meta_path)
-
-# print(f"Loaded {len(indexes)} indexes ✅\n")
-
-
-# # ── Intent Detection ──────────────────────────────────────────────────────────
-# def detect_intent(query):
-#     q = query.lower()
-
-#     if any(w in q for w in ["bail", "custody", "arrest"]):
-#         return ["RPC", "RATIO"], False
-
-#     if any(w in q for w in ["murder", "homicide", "death"]):
-#         return ["RPC", "RATIO", "FAC"], False
-
-#     if any(w in q for w in ["rape", "sexual"]):
-#         return ["RPC", "RATIO", "FAC"], False
-
-#     if any(w in q for w in ["fraud", "cheating", "420"]):
-#         return ["RPC", "RATIO", "STA", "ALL"], False
-
-#     if any(w in q for w in ["section", "law", "act"]):
-#         return ["STA", "ISSUE"], False
-
-#     # ── NEW: generalised fallback — search ALL roles broadly ──
-#     return ["RPC", "RATIO", "FAC", "STA", "ISSUE", "PRE_RELIED", "ALL"], True
-
-
-# # ── Confidence Score Computation (NEW) ───────────────────────────────────────
-# def compute_confidence_scores(scores):
-#     """
-#     Normalise raw cross-encoder scores to [0, 1] using min-max scaling.
-#     Returns a list of floats in the same order as input scores.
-#     """
-#     arr = np.array(scores, dtype=np.float32)
-#     min_s, max_s = arr.min(), arr.max()
-#     if max_s - min_s < 1e-6:
-#         return [1.0] * len(scores)
-#     return ((arr - min_s) / (max_s - min_s)).tolist()
-
-
-# # ── Role-Aware Search ─────────────────────────────────────────────────────────
-# def search_and_rerank(query, top_k=5, initial_k=20):
-
-#     query_embedding = bi_encoder.encode([query])
-#     query_embedding = np.array(query_embedding).astype("float32")
-
-#     # ── CHANGED: unpack the new is_general flag ──
-#     roles, is_general = detect_intent(query)
-
-#     # For generalised queries, cast a wider net
-#     if is_general:
-#         initial_k = min(initial_k * 2, 40)
-
-#     doc_chunks = {}
-
-#     for role in roles:
-#         if role not in indexes:
-#             continue
-
-#         idx     = indexes[role]
-#         role_df = meta[role]
-
-#         k = min(initial_k, idx.ntotal)
-#         _, idxs = idx.search(query_embedding, k)
-
-#         for i in idxs[0]:
-#             if i < 0 or i >= len(role_df):
-#                 continue
-
-#             row    = role_df.iloc[i]
-#             doc_id = row["doc_id"]
-
-#             if doc_id not in doc_chunks:
-#                 doc_chunks[doc_id] = []
-
-#             doc_chunks[doc_id].append((row["text"], role))
-
-#     # Merge chunks
-#     merged_docs = []
-
-#     for doc_id, chunks in doc_chunks.items():
-#         combined_text = " ".join([c[0] for c in chunks[:3]])
-#         roles_used    = list(set([c[1] for c in chunks]))
-#         merged_docs.append((doc_id, combined_text, roles_used))
-
-#     # Rerank
-#     pairs  = [[query, doc[1]] for doc in merged_docs]
-#     scores = cross_encoder.predict(pairs)
-
-#     # ── NEW: compute confidence scores before sorting ──
-#     confidence_scores = compute_confidence_scores(scores)
-
-#     ranked = sorted(
-#         [
-#             (merged_docs[i], scores[i], confidence_scores[i])
-#             for i in range(len(scores))
-#         ],
-#         key=lambda x: x[1],
-#         reverse=True
-#     )
-
-#     return ranked[:top_k]
-
-
-# # ── Reasoning Extraction ──────────────────────────────────────────────────────
-# def extract_reasoning(query, text):
-
-#     sentences   = text.split(".")
-#     query_words = query.lower().split()
-#     important   = []
-
-#     for s in sentences:
-#         s = s.strip().lower()
-#         if len(s) < 40:
-#             continue
-
-#         if any(qw in s for qw in query_words):
-#             important.append(s)
-
-#         if any(w in s for w in ["held", "observed", "court", "evidence", "intention"]):
-#             important.append(s)
-
-#         if len(important) >= 3:
-#             break
-
-#     return list(set(important))[:3]
-
-
-# # ── Answer Generation ─────────────────────────────────────────────────────────
-# def generate_answer(query, results):
-
-#     answer  = "\n🧠 Answer:\n\n"
-#     answer += "📚 Relevant Case Insights:\n\n"
-
-#     reasoning_all = []
-
-#     # ── CHANGED: unpack the extra confidence value from results ──
-#     for i, ((doc_id, text, roles), score, confidence) in enumerate(results, 1):
-
-#         short_text = text[:600].replace("\n", " ")
-#         conf_pct   = f"{confidence * 100:.1f}%"   # NEW: format as percentage
-
-#         answer += f"{i}. Case {doc_id}  |  Confidence: {conf_pct}\n"  # NEW: shown here
-#         answer += f"   → {short_text}...\n"
-
-#         reasoning = extract_reasoning(query, text)
-#         reasoning_all.extend(reasoning)
-
-#         answer += "\n"
-
-#     answer += "🔍 Legal Patterns Observed:\n"
-
-#     reasoning_all = list(set(reasoning_all))[:5]
-
-#     for r in reasoning_all:
-#         answer += f"- {r.capitalize()}.\n"
-
-#     answer += "\n⚖️ Final Answer:\n"
-#     answer += (
-#         "Based on the above cases, the outcome depends on specific facts, "
-#         "intent, and strength of evidence. Courts rely heavily on reasoning "
-#         "from similar precedents rather than a fixed rule."
-#     )
-
-#     return answer
-
-
-# # ── Decision Support ──────────────────────────────────────────────────────────
-# def decision_support(results):
-
-#     positive = 0
-#     negative = 0
-
-#     # ── CHANGED: unpack the extra confidence value ──
-#     for (doc, score, confidence) in results:
-#         text = doc[1].lower()
-
-#         if "granted" in text or "allowed" in text:
-#             positive += 1
-#         if "denied" in text or "dismissed" in text:
-#             negative += 1
-
-#     if positive > negative:
-#         return "⚖️ Trend: Relief is often granted in similar cases"
-#     elif negative > positive:
-#         return "⚖️ Trend: Relief is often denied in similar cases"
-#     else:
-#         return "⚖️ Trend: Mixed outcomes (case-specific)"
-
-
-# # ── Main ──────────────────────────────────────────────────────────────────────
-# def main():
-
-#     while True:
-#         print("\n" + "="*50)
-
-#         query = input("Enter your legal query (or 'quit'): ").strip()
-
-#         if query.lower() == "quit":
-#             break
-
-#         if not query:
-#             continue
-
-#         print("\n🔍 Searching relevant cases...\n")
-
-#         results = search_and_rerank(query)
-
-#         if not results:
-#             print("No results found.")
-#             continue
-
-#         print("="*50)
-#         print("        🧠 LEGAL ASSISTANT RESPONSE")
-#         print("="*50)
-
-#         print(generate_answer(query, results))
-#         print("\n" + decision_support(results))
-
-
-# if __name__ == "__main__":
-#     main()
-
-
-import os
-os.environ["CUDA_VISIBLE_DEVICES"] = "0"
-
-import pandas as pd
-import faiss
 import numpy as np
-from sentence_transformers import SentenceTransformer, CrossEncoder
+import pandas as pd
 
-# ── Config ───────────────────────────────────────────────────────────────────
-INDEX_DIR  = "faiss_indexes"
-MODEL_NAME = "Sayyam9/legal-bert-aila-finetuned"
+import config
+from legal_text import split_sentences
+from tag_roles import sentence_roles
 
-# ── Load models ───────────────────────────────────────────────────────────────
-print("Loading models...")
-bi_encoder    = SentenceTransformer(MODEL_NAME, device="cpu")
-cross_encoder = CrossEncoder("cross-encoder/ms-marco-MiniLM-L-12-v2", device="cpu")
-print("Models loaded ✅")
+DISCLAIMER = ("Research aid only, not legal advice. Results come from a fixed corpus of "
+              "2,914 Supreme Court judgments (AILA 2019) and may be incomplete or outdated.")
 
-# ── Load indexes ──────────────────────────────────────────────────────────────
-ROLES = ["RPC", "RATIO", "FAC", "STA", "ISSUE",
-         "PRE_RELIED", "RLC", "PREAMBLE", "ARG_PETITIONER", "ALL"]
+# ── Intent detection ──────────────────────────────────────────────────────────
+# Each intent lists the roles whose indexes get an extra search. The ALL index
+# is always searched too, so a wrong intent can no longer hide relevant cases.
+INTENTS: list[tuple[str, re.Pattern, list[str]]] = [
+    ("bail", re.compile(r"\b(anticipatory bail|bail|custody|arrest(ed)?|remand|section 438|section 439)\b", re.I),
+     ["RATIO", "RPC", "ANALYSIS"]),
+    ("homicide", re.compile(r"\b(murder|homicide|culpable|killed|killing|section 30[24]|death sentence|life imprisonment)\b", re.I),
+     ["RATIO", "FAC", "ANALYSIS", "RPC"]),
+    ("sexual offences", re.compile(r"\b(rape|sexual|pocso|outrag\w* (the )?modesty|section 376|section 354)\b", re.I),
+     ["RATIO", "FAC", "ANALYSIS"]),
+    ("dowry / cruelty", re.compile(r"\b(dowry|498 ?a|304 ?b|cruelty|harass\w*|bride burning)\b", re.I),
+     ["RATIO", "FAC", "ANALYSIS"]),
+    ("fraud / cheating", re.compile(r"\b(fraud\w*|cheat\w*|section 420|forg\w+|misappropriat\w*|breach of trust|section 40[69])\b", re.I),
+     ["RATIO", "STA", "ANALYSIS"]),
+    ("narcotics", re.compile(r"\b(ndps|narcotic\w*|ganja|heroin|opium|charas|contraband|psychotropic)\b", re.I),
+     ["RATIO", "STA", "ANALYSIS"]),
+    ("corruption", re.compile(r"\b(bribe\w*|corrupt\w*|illegal gratification|disproportionate assets)\b", re.I),
+     ["RATIO", "STA", "ANALYSIS"]),
+    ("service law", re.compile(r"\b(dismiss\w* from service|terminat\w*|promotion|seniority|pension|disciplinary|departmental (inquiry|enquiry|proceedings?)|suspension)\b", re.I),
+     ["RATIO", "ISSUE", "RLC"]),
+    ("property / land", re.compile(r"\b(property|land acquisition|acquisition|tenan\w*|evict\w*|possession|partition|title deed|easement)\b", re.I),
+     ["RATIO", "ISSUE", "FAC"]),
+    ("constitutional", re.compile(r"\b(article \d+|fundamental rights?|writ|habeas corpus|constitution\w*)\b", re.I),
+     ["RATIO", "ISSUE", "STA"]),
+    ("evidence", re.compile(r"\b(confession|eye ?witness\w*|circumstantial|dying declaration|hostile witness|recovery|identification parade|last seen)\b", re.I),
+     ["RATIO", "ANALYSIS"]),
+    ("statute lookup", re.compile(r"\b(what (is|does) (section|article)|meaning of (section|article)|define (section|article)|ingredients of (section|the offence))\b", re.I),
+     ["STA", "ISSUE"]),
+]
 
-indexes = {}
-meta    = {}
-
-print("Loading indexes...")
-for role in ROLES:
-    idx_path  = os.path.join(INDEX_DIR, f"index_{role}.bin")
-    meta_path = os.path.join(INDEX_DIR, f"meta_{role}.csv")
-
-    if os.path.exists(idx_path):
-        indexes[role] = faiss.read_index(idx_path)
-        meta[role]    = pd.read_csv(meta_path)
-
-print(f"Loaded {len(indexes)} indexes ✅\n")
-
-
-# ── Intent Detection ──────────────────────────────────────────────────────────
-def detect_intent(query):
-    q = query.lower()
-
-    if any(w in q for w in ["bail", "custody", "arrest"]):
-        return ["RPC", "RATIO"], False
-
-    if any(w in q for w in ["murder", "homicide", "death"]):
-        return ["RPC", "RATIO", "FAC"], False
-
-    if any(w in q for w in ["rape", "sexual"]):
-        return ["RPC", "RATIO", "FAC"], False
-
-    if any(w in q for w in ["fraud", "cheating", "420"]):
-        return ["RPC", "RATIO", "STA", "ALL"], False
-
-    if any(w in q for w in ["section", "law", "act"]):
-        return ["STA", "ISSUE"], False
-
-    # ── NEW: generalised fallback — search ALL roles broadly ──
-    return ["RPC", "RATIO", "FAC", "STA", "ISSUE", "PRE_RELIED", "ALL"], True
+_STOPWORDS = set("""a an the and or of to in on for with by at from as is are was were be been being this that these those
+it its into over under about whether what which who whom when where why how can could should would may might will shall do does
+did not no any all some such case cases court law legal my our your their his her him he she they them i we you there than then
+if so also has have had upon against between after before during within without more most other""".split())
 
 
-# ── Confidence Score Computation (NEW) ───────────────────────────────────────
-def compute_confidence_scores(scores):
-    """
-    Normalise raw cross-encoder scores to [0, 1] using min-max scaling.
-    Returns a list of floats in the same order as input scores.
-    """
-    arr = np.array(scores, dtype=np.float32)
-    min_s, max_s = arr.min(), arr.max()
-    if max_s - min_s < 1e-6:
-        return [1.0] * len(scores)
-    return ((arr - min_s) / (max_s - min_s)).tolist()
+@dataclass
+class Intent:
+    names: list[str]
+    roles: list[str]
+
+    @property
+    def label(self) -> str:
+        return ", ".join(self.names) if self.names else "general"
 
 
-# ── Role-Aware Search ─────────────────────────────────────────────────────────
-def search_and_rerank(query, top_k=5, initial_k=20):
+def detect_intent(query: str) -> Intent:
+    names, roles = [], []
+    for name, pattern, intent_roles in INTENTS:
+        if pattern.search(query):
+            names.append(name)
+            roles += [r for r in intent_roles if r not in roles]
+    if not roles:
+        roles = ["RATIO", "ISSUE", "FAC"]
+    return Intent(names, roles)
 
-    query_embedding = bi_encoder.encode([query])
-    query_embedding = np.array(query_embedding).astype("float32")
 
-    # ── CHANGED: unpack the new is_general flag ──
-    roles, is_general = detect_intent(query)
+def query_terms(query: str) -> set[str]:
+    words = re.findall(r"[a-z0-9]+", query.lower())
+    return {w for w in words if w not in _STOPWORDS and (len(w) > 2 or w.isdigit())}
 
-    # For generalised queries, cast a wider net
-    if is_general:
-        initial_k = min(initial_k * 2, 40)
 
-    doc_chunks = {}
+def rrf_fuse(ranked_lists: list[list[int]], weights: list[float] | None = None,
+             k: int = 60) -> dict[int, float]:
+    """Weighted reciprocal-rank fusion: sum of w / (k + rank) over the lists an item appears in."""
+    weights = weights or [1.0] * len(ranked_lists)
+    fused: dict[int, float] = defaultdict(float)
+    for ranked, w in zip(ranked_lists, weights):
+        for rank, item in enumerate(ranked, 1):
+            fused[item] += w / (k + rank)
+    return dict(fused)
 
-    for role in roles:
-        if role not in indexes:
-            continue
 
-        idx     = indexes[role]
-        role_df = meta[role]
+# ── Result types ──────────────────────────────────────────────────────────────
+@dataclass
+class CaseResult:
+    case_id: str
+    title: str
+    year: str
+    outcome: str
+    appellant: str
+    relevance: float           # 0-1, cross-encoder probability (or bi-encoder proxy)
+    roles: list[str]
+    citations: list[str]
+    key_passages: list[dict]   # [{"text": ..., "roles": [...]}]
+    passage: str               # best-matching passage
 
-        k = min(initial_k, idx.ntotal)
-        _, idxs = idx.search(query_embedding, k)
 
-        for i in idxs[0]:
-            if i < 0 or i >= len(role_df):
+@dataclass
+class StatuteResult:
+    statute_id: str
+    title: str
+    relevance: float
+    text: str
+
+
+@dataclass
+class AssistantResponse:
+    query: str
+    intent: str
+    cases: list[CaseResult]
+    statutes: list[StatuteResult]
+    outcome_summary: dict
+    disclaimer: str = DISCLAIMER
+    notes: list[str] = field(default_factory=list)
+    answer: dict | None = None   # grounded, cited summary (see answer.py)
+
+    def to_dict(self) -> dict:
+        return asdict(self)
+
+
+# ── Assistant ─────────────────────────────────────────────────────────────────
+class LegalAssistant:
+    def __init__(self, index_dir=config.INDEX_DIR, bi_encoder: str | None = None,
+                 cross_encoder: str | None = config.CROSS_ENCODER, device: str | None = None,
+                 verbose: bool = True):
+        import faiss
+        from sentence_transformers import SentenceTransformer
+
+        self.index_dir = index_dir
+        self.verbose = verbose
+        manifest_path = index_dir / "manifest.json"
+        if not manifest_path.exists():
+            raise FileNotFoundError(
+                f"No indexes in {index_dir}. Build them first:\n"
+                "  python preprocess.py && python tag_roles.py && python build_role_index.py")
+        manifest = json.loads(manifest_path.read_text())
+        bi_encoder = bi_encoder or manifest["model"]
+        if bi_encoder != manifest["model"]:
+            self._log(f"WARNING: indexes were built with {manifest['model']} but querying with "
+                      f"{bi_encoder}. Rebuild the indexes or results will be meaningless.")
+        device = device or config.get_device()
+
+        self._log(f"Loading bi-encoder {bi_encoder} on {device}...")
+        self.bi_encoder = SentenceTransformer(bi_encoder, device=device)
+        self.bi_encoder.max_seq_length = min(self.bi_encoder.max_seq_length or 512, 512)
+        self.cross_encoder = None
+        if cross_encoder:
+            from sentence_transformers import CrossEncoder
+            self._log(f"Loading cross-encoder {cross_encoder}...")
+            self.cross_encoder = CrossEncoder(cross_encoder, device=device, max_length=512)
+
+        self._log("Loading indexes...")
+        self.meta = pd.read_csv(index_dir / f"meta_{config.ALL_INDEX}.csv", keep_default_na=False)
+        self.indexes, self.positions = {}, {}
+        for name in manifest["indexes"]:
+            self.indexes[name] = faiss.read_index(str(index_dir / f"index_{name}.bin"))
+            if name != config.ALL_INDEX:
+                self.positions[name] = np.load(index_dir / f"positions_{name}.npy")
+        self.bm25 = None
+        if (index_dir / "bm25.pkl").exists():
+            from lexical import BM25Index
+            self.bm25 = BM25Index.load(index_dir / "bm25.pkl")
+        else:
+            self._log("No bm25.pkl found: running dense-only. Re-run build_role_index.py for hybrid search.")
+
+        cases = pd.read_csv(config.CASES_CSV, keep_default_na=False,
+                            usecols=["case_id", "title", "year", "outcome", "appellant", "citations"])
+        self.case_info = cases.set_index("case_id").to_dict("index")
+        statutes = pd.read_csv(config.STATUTES_CSV, keep_default_na=False)
+        self.statute_info = statutes.set_index("statute_id").to_dict("index")
+        self._log(f"Ready: {len(self.meta)} chunks, {len(self.indexes)} indexes, "
+                  f"{len(self.case_info)} cases, {len(self.statute_info)} statutes.\n")
+
+    def _log(self, msg: str) -> None:
+        if self.verbose:
+            print(msg, file=sys.stderr)
+
+    # ── retrieval ─────────────────────────────────────────────────────────────
+    def _retrieve(self, query: str, query_emb: np.ndarray, roles: list[str],
+                  k_all: int, k_role: int, k_lex: int) -> dict[int, float]:
+        """Hybrid candidate generation.
+
+        Dense hits from the ALL index and the intent's role indexes, plus lexical
+        BM25 hits (exact section numbers, names and legal terms that embeddings
+        blur), fused with reciprocal-rank fusion. Returns {row in meta_ALL: score}.
+        """
+        # Weights: the ALL dense index and BM25 count equally; role indexes add a
+        # smaller intent-specific boost so they can't outvote the lexical signal.
+        ranked_lists: list[list[int]] = []
+        weights: list[float] = []
+        _, idx = self.indexes[config.ALL_INDEX].search(query_emb, min(k_all, len(self.meta)))
+        ranked_lists.append([int(i) for i in idx[0] if i >= 0])
+        weights.append(1.0)
+        for role in roles:
+            if role not in self.indexes:
                 continue
+            index = self.indexes[role]
+            _, idx = index.search(query_emb, min(k_role, index.ntotal))
+            ranked_lists.append([int(self.positions[role][i]) for i in idx[0] if i >= 0])
+            weights.append(0.3)
+        if self.bm25 is not None and k_lex > 0:
+            idx, s = self.bm25.top_k(query, k_lex)
+            ranked_lists.append([int(i) for i, v in zip(idx, s) if v > 0])
+            weights.append(1.0)
+        return rrf_fuse(ranked_lists, weights)
 
-            row    = role_df.iloc[i]
-            doc_id = row["doc_id"]
+    def _score(self, query: str, rows: list[int], fused: dict[int, float]) -> np.ndarray:
+        if self.cross_encoder is None:
+            # Without a reranker, use the fused rank score scaled to the best candidate.
+            f = np.array([fused[r] for r in rows])
+            return f / f.max()
+        pairs = [(query, self.meta.at[r, "text"]) for r in rows]
+        raw = np.asarray(self.cross_encoder.predict(pairs, batch_size=32, show_progress_bar=False),
+                         dtype=np.float64).reshape(-1)
+        if raw.min() < 0 or raw.max() > 1:  # model returned logits
+            raw = 1.0 / (1.0 + np.exp(-raw))
+        return raw
 
-            if doc_id not in doc_chunks:
-                doc_chunks[doc_id] = []
+    def ask(self, query: str, top_k: int = 5, n_statutes: int = 3,
+            k_all: int = 50, k_role: int = 15, k_lex: int = 50, max_rerank: int = 100,
+            answer: bool | str = False) -> AssistantResponse:
+        """Retrieve, rerank and explain. `answer=True` (or a provider name such as
+        "anthropic", "openai", "extractive") also writes a cited summary."""
+        query = " ".join(query.split())
+        intent = detect_intent(query)
+        q_emb = self.bi_encoder.encode([query], convert_to_numpy=True).astype("float32")
 
-            doc_chunks[doc_id].append((row["text"], role))
+        fused = self._retrieve(query, q_emb, intent.roles, k_all, k_role, k_lex)
+        rows = sorted(fused, key=fused.get, reverse=True)[:max_rerank]
+        scores = self._score(query, rows, fused)
 
-    # Merge chunks
-    merged_docs = []
+        # Aggregate chunk scores into documents: a document is as relevant as
+        # its best passage (MaxP), with role tags pooled across its passages.
+        best: dict[str, tuple[float, int]] = {}
+        doc_roles: dict[str, set] = defaultdict(set)
+        for r, s in zip(rows, scores):
+            doc_id = self.meta.at[r, "doc_id"]
+            doc_roles[doc_id] |= {x for x in self.meta.at[r, "roles"].split("|") if x}
+            if doc_id not in best or s > best[doc_id][0]:
+                best[doc_id] = (float(s), r)
+        ranked = sorted(best.items(), key=lambda kv: kv[1][0], reverse=True)
 
-    for doc_id, chunks in doc_chunks.items():
-        combined_text = " ".join([c[0] for c in chunks[:3]])
-        roles_used    = list(set([c[1] for c in chunks]))
-        merged_docs.append((doc_id, combined_text, roles_used))
+        terms = query_terms(query)
+        cases, statutes = [], []
+        for doc_id, (score, row) in ranked:
+            text = self.meta.at[row, "text"]
+            if self.meta.at[row, "doc_type"] == "statute":
+                if len(statutes) < n_statutes:
+                    info = self.statute_info.get(doc_id, {})
+                    statutes.append(StatuteResult(doc_id, info.get("title", doc_id), round(score, 3),
+                                                  info.get("description", text)[:600]))
+                continue
+            if len(cases) >= top_k:
+                continue
+            info = self.case_info.get(doc_id, {})
+            cases.append(CaseResult(
+                case_id=doc_id,
+                title=info.get("title") or doc_id,
+                year=str(info.get("year", "")),
+                outcome=info.get("outcome", "Unclear"),
+                appellant=info.get("appellant", ""),
+                relevance=round(score, 3),
+                roles=sorted(doc_roles[doc_id]),
+                citations=[c for c in str(info.get("citations", "")).split("|") if c][:4],
+                key_passages=self._key_passages(text, terms),
+                passage=text,
+            ))
 
-    # Rerank
-    pairs  = [[query, doc[1]] for doc in merged_docs]
-    scores = cross_encoder.predict(pairs)
+        notes = []
+        if self.cross_encoder is None:
+            notes.append("Reranker disabled: relevance is relative to the best match, not absolute.")
+        elif cases and max(c.relevance for c in cases) < 0.2:
+            notes.append("Low relevance overall: the corpus may not contain a close match for this query. "
+                         "Try describing the facts or the legal question more specifically.")
+        resp = AssistantResponse(query, intent.label, cases, statutes, self._outcome_summary(cases), notes=notes)
+        if answer:
+            from answer import synthesize
+            d = resp.to_dict()
+            resp.answer = synthesize(query, d["cases"], d["statutes"],
+                                     provider=answer if isinstance(answer, str) else None).to_dict()
+        return resp
 
-    # ── NEW: compute confidence scores before sorting ──
-    confidence_scores = compute_confidence_scores(scores)
+    # ── explanation ───────────────────────────────────────────────────────────
+    @staticmethod
+    def _key_passages(text: str, terms: set[str], n: int = 3) -> list[dict]:
+        """Pick the sentences that best explain why this passage matched."""
+        weights = {"RATIO": 2.0, "RPC": 1.5, "ISSUE": 1.2, "ANALYSIS": 1.0, "PRE_RELIED": 0.8, "STA": 0.5}
+        scored = []
+        for i, s in enumerate(split_sentences(text)):
+            if len(s) < 50:
+                continue
+            words = set(re.findall(r"[a-z0-9]+", s.lower()))
+            overlap = len(terms & words)
+            roles = sentence_roles(s)
+            score = overlap + sum(weights.get(r, 0.0) for r in roles)
+            if score > 0:
+                scored.append((score, i, s, sorted(roles)))
+        top = sorted(scored, key=lambda x: (-x[0], x[1]))[:n]
+        if not top:  # nothing stands out: show the opening of the passage instead
+            top = [(0, i, s, []) for i, s in enumerate(split_sentences(text)) if len(s) >= 50][:2]
+        return [{"text": s if len(s) <= 400 else s[:400].rsplit(" ", 1)[0] + " ...", "roles": roles}
+                for _, _, s, roles in sorted(top, key=lambda x: x[1])]
 
-    ranked = sorted(
-        [
-            (merged_docs[i], scores[i], confidence_scores[i])
-            for i in range(len(scores))
-        ],
-        key=lambda x: x[1],
-        reverse=True
-    )
-
-    return ranked[:top_k]
-
-
-# ── Reasoning Extraction (query-aware) ───────────────────────────────────────
-def extract_reasoning(query, text):
-    """
-    Return sentences that are directly relevant to the query.
-    Priority: query-word match > legal signal words.
-    Returns up to 5 sentences (increased from 3) for richer output.
-    """
-    sentences   = text.split(".")
-    query_words = [w for w in query.lower().split() if len(w) > 3]  # skip stopwords
-    important   = []
-    seen        = set()
-
-    for s in sentences:
-        s_clean = s.strip()
-        if len(s_clean) < 40:
-            continue
-        s_lower = s_clean.lower()
-        if s_lower in seen:
-            continue
-
-        # Higher priority: sentence directly mentions query terms
-        query_hits = sum(1 for qw in query_words if qw in s_lower)
-        legal_hit  = any(w in s_lower for w in [
-            "held", "observed", "court", "evidence", "intention",
-            "principle", "liability", "convicted", "acquitted",
-            "section", "ipc", "accused", "judgment", "appeal"
-        ])
-
-        if query_hits >= 2 or (query_hits >= 1 and legal_hit):
-            important.insert(0, s_clean)   # query-matched sentences go first
-            seen.add(s_lower)
-        elif legal_hit and len(important) < 5:
-            important.append(s_clean)
-            seen.add(s_lower)
-
-        if len(important) >= 5:
-            break
-
-    return important[:5]
-
-
-# ── Query-Aware Final Answer Builder ─────────────────────────────────────────
-def build_final_answer(query, reasoning_all):
-    """
-    Construct a specific answer paragraph using extracted sentences
-    rather than a fixed generic string.
-    """
-    if not reasoning_all:
-        return (
-            "Based on the retrieved cases, the outcome depends on specific facts, "
-            "intent, and strength of evidence."
-        )
-
-    # Deduplicate while preserving order
-    seen, unique = set(), []
-    for s in reasoning_all:
-        key = s.lower()[:60]
-        if key not in seen:
-            seen.add(key)
-            unique.append(s)
-
-    answer  = f'Regarding "{query}", the Supreme Court has observed:\n\n'
-    for s in unique[:5]:
-        answer += f"  • {s.strip().rstrip('.')}.\n"
-    return answer
-
-
-# ── Answer Generation ─────────────────────────────────────────────────────────
-def generate_answer(query, results):
-
-    answer  = "\n🧠 Answer:\n\n"
-    answer += "📚 Relevant Case Insights:\n\n"
-
-    reasoning_all = []
-
-    for i, ((doc_id, text, roles), score, confidence) in enumerate(results, 1):
-
-        # ── CHANGED: show up to 600 chars, no trailing ellipsis mid-sentence ──
-        excerpt    = text[:600].replace("\n", " ").rsplit(" ", 1)[0]
-        conf_pct   = f"{confidence * 100:.1f}%"
-        roles_str  = ", ".join(roles)
-
-        answer += f"{i}. Case {doc_id}  |  Confidence: {conf_pct}  |  Roles: {roles_str}\n"
-        answer += f"   {excerpt}\n\n"
-
-        reasoning = extract_reasoning(query, text)
-        reasoning_all.extend(reasoning)
-
-    answer += "🔍 Legal Patterns Observed:\n"
-    patterns = list(dict.fromkeys(                        # deduplicate, keep order
-        s for s in reasoning_all if len(s) > 40
-    ))[:5]
-    for r in patterns:
-        answer += f"  • {r.rstrip('.')}.\n"
-
-    answer += "\n⚖️ Final Answer:\n"
-    answer += build_final_answer(query, reasoning_all)    # ── CHANGED: query-aware
-
-    return answer
+    @staticmethod
+    def _outcome_summary(cases: list[CaseResult]) -> dict:
+        counts = Counter(c.outcome for c in cases)
+        decided = {k: v for k, v in counts.items() if k in ("Allowed", "Partly allowed", "Dismissed")}
+        total = sum(decided.values())
+        if total == 0:
+            trend = "No clear pattern: the retrieved judgments were disposed of without a clear win/loss."
+        else:
+            success = decided.get("Allowed", 0) + decided.get("Partly allowed", 0)
+            share = success / total
+            if share >= 0.67:
+                trend = "Most similar appeals/petitions succeeded (fully or partly)."
+            elif share <= 0.33:
+                trend = "Most similar appeals/petitions were dismissed."
+            else:
+                trend = "Mixed outcomes: the result turned on the facts of each case."
+        state_appeals = sum(1 for c in cases if c.appellant == "State/Government")
+        caveat = ("'Allowed' means the party that appealed won; in "
+                  f"{state_appeals} of these {len(cases)} cases that party was the State.") if state_appeals else \
+                 "'Allowed' means the party that appealed won."
+        return {"counts": dict(counts), "trend": trend, "caveat": caveat}
 
 
-# ── Decision Support ──────────────────────────────────────────────────────────
-def decision_support(results):
+# ── CLI formatting ────────────────────────────────────────────────────────────
+def format_response(resp: AssistantResponse) -> str:
+    out = [f"\nQuery intent: {resp.intent}", "=" * 70]
+    if not resp.cases and not resp.statutes:
+        out.append("No results found.")
+        return "\n".join(out)
+    if resp.answer:
+        a = resp.answer
+        out.append(f"ANSWER  ({a['provider']}{', unsupported citations removed' if a['removed_citations'] else ''})")
+        out.append(a["text"])
+        if a["removed_citations"]:
+            out.append(f"  (removed citations to sources that were not retrieved: {', '.join(a['removed_citations'])})")
+        out.append("")
+    out.append("RELEVANT JUDGMENTS")
+    for i, c in enumerate(resp.cases, 1):
+        year = f" ({c.year})" if c.year else ""
+        out.append(f"\n{i}. {c.title}{year}  [{c.case_id}]")
+        out.append(f"   Relevance: {c.relevance:.0%}  |  Outcome: {c.outcome}  |  Appellant: {c.appellant}")
+        if c.citations:
+            out.append(f"   Provisions: {', '.join(c.citations)}")
+        for p in c.key_passages:
+            tag = f" [{', '.join(p['roles'])}]" if p["roles"] else ""
+            out.append(f"   • {p['text']}{tag}")
+    if resp.statutes:
+        out.append("\nRELEVANT STATUTES")
+        for s in resp.statutes:
+            out.append(f"  • {s.title} [{s.statute_id}]  ({s.relevance:.0%})")
+    o = resp.outcome_summary
+    out.append("\nOUTCOMES IN SIMILAR CASES")
+    out.append("  " + ", ".join(f"{k}: {v}" for k, v in o["counts"].items()))
+    out.append(f"  {o['trend']}")
+    out.append(f"  Note: {o['caveat']}")
+    for n in resp.notes:
+        out.append(f"\n! {n}")
+    out.append(f"\n{resp.disclaimer}")
+    return "\n".join(out)
 
-    positive = 0
-    negative = 0
 
-    # ── CHANGED: unpack the extra confidence value ──
-    for (doc, score, confidence) in results:
-        text = doc[1].lower()
-
-        if "granted" in text or "allowed" in text:
-            positive += 1
-        if "denied" in text or "dismissed" in text:
-            negative += 1
-
-    if positive > negative:
-        return "⚖️ Trend: Relief is often granted in similar cases"
-    elif negative > positive:
-        return "⚖️ Trend: Relief is often denied in similar cases"
-    else:
-        return "⚖️ Trend: Mixed outcomes (case-specific)"
-
-
-# ── Main ──────────────────────────────────────────────────────────────────────
 def main():
+    parser = argparse.ArgumentParser(description="AI legal assistant for Indian case law")
+    parser.add_argument("-q", "--query", help="ask one question and exit")
+    parser.add_argument("-k", "--top-k", type=int, default=5)
+    parser.add_argument("--no-rerank", action="store_true", help="skip the cross-encoder (faster)")
+    parser.add_argument("--model", default=None, help="bi-encoder (defaults to the one the indexes were built with)")
+    parser.add_argument("--json", action="store_true", help="print JSON instead of text")
+    parser.add_argument("--answer", nargs="?", const=True, default=False,
+                        help="add a cited summary; optionally name the provider (anthropic|openai|extractive)")
+    args = parser.parse_args()
 
+    assistant = LegalAssistant(bi_encoder=args.model, cross_encoder=None if args.no_rerank else config.CROSS_ENCODER)
+
+    def run(q: str):
+        resp = assistant.ask(q, top_k=args.top_k, answer=args.answer)
+        print(json.dumps(resp.to_dict(), indent=2) if args.json else format_response(resp))
+
+    if args.query:
+        run(args.query)
+        return
     while True:
-        print("\n" + "="*50)
-
-        query = input("Enter your legal query (or 'quit'): ").strip()
-
-        if query.lower() == "quit":
+        try:
+            q = input("\nEnter your legal query (or 'quit'): ").strip()
+        except (EOFError, KeyboardInterrupt):
             break
-
-        if not query:
-            continue
-
-        print("\n🔍 Searching relevant cases...\n")
-
-        results = search_and_rerank(query)
-
-        if not results:
-            print("No results found.")
-            continue
-
-        print("="*50)
-        print("        🧠 LEGAL ASSISTANT RESPONSE")
-        print("="*50)
-
-        print(generate_answer(query, results))
-        print("\n" + decision_support(results))
+        if q.lower() in {"quit", "exit", "q"}:
+            break
+        if q:
+            run(q)
 
 
 if __name__ == "__main__":

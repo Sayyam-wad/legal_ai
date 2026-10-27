@@ -1,0 +1,26 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+      - name: Install lightweight dependencies
+        # Unit tests don't load any model, so skip torch/transformers in CI.
+        run: pip install numpy pandas scipy scikit-learn tqdm flask pytest ruff
+      - name: Lint
+        run: ruff check .
+      - name: Unit tests
+        run: pytest -q
+      - name: Preprocess AILA data and score the BM25 baseline
+        run: |
+          python preprocess.py > /dev/null
+          python evaluate.py --methods bm25 --split all

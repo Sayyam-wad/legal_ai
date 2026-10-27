@@ -40,3 +40,7 @@ __pycache__/
 .DS_Store
 Thumbs.db
 faiss_indexes/
+# Generated
+models/
+.pytest_cache/
+.ruff_cache/
